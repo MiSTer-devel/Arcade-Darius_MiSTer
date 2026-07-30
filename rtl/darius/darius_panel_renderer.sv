@@ -33,11 +33,18 @@
 module darius_panel_renderer
 #(
 	parameter [9:0] X_OFFSET = 10'd0,
-	parameter [9:0] H_PIXELS = 10'd288
+	parameter [9:0] H_PIXELS = 10'd288,
+	parameter       SS_IDX   = -1      // savestate: indice slave palette (pattern F2)
 )
 (
 	input  wire        clk,
 	input  wire        reset,
+
+	// Savestate (pattern F2: ssbus dentro al chip) — palette locale
+	ssbus_if.slave     ssbus,
+	// Savestate: load registri scroll/ctrl al restore (da auto_save_adaptor nel top)
+	input  wire        ss_regs_ld,
+	input  wire [15:0] ss_xs0, ss_xs1, ss_ys0, ss_ys1, ss_c0, ss_c1,
 	input  wire  [9:0] render_x,
 	input  wire  [8:0] render_y,
 
@@ -117,6 +124,11 @@ always @(posedge clk) begin
 		xscroll[0] <= 0; xscroll[1] <= 0;
 		yscroll[0] <= 0; yscroll[1] <= 0;
 		ctrl[0]    <= 0; ctrl[1]    <= 0;
+	end else if (ss_regs_ld) begin
+		// restore savestate: ricarica i registri (CPU ferme)
+		xscroll[0] <= ss_xs0; xscroll[1] <= ss_xs1;
+		yscroll[0] <= ss_ys0; yscroll[1] <= ss_ys1;
+		ctrl[0]    <= ss_c0;  ctrl[1]    <= ss_c1;
 	end else if (wr_pulse) begin
 		if (xscroll_sel) xscroll[layer_sel] <= cpu_bus_wdata;
 		if (yscroll_sel) yscroll[layer_sel] <= cpu_bus_wdata;
@@ -144,14 +156,34 @@ wire  [1:0] pal_cpu_be = ~cpu_bus_dsn;
 reg [15:0] pal_data;
 reg [10:0] pal_lookup_addr;
 
+// Savestate: adaptor sulla gamba SUB (durante SS le CPU sono ferme, la gamba
+// è libera); gather-read sull'indirizzo muxato della porta di scrittura
+// (stessa porta fisica), lookup renderer sull'altra porta. 2 porte = M10K TDP.
+wire        sspl_we_lo, sspl_we_hi;
+wire [10:0] sspl_addr;
+wire [15:0] sspl_wdata;
+reg  [15:0] pal_ss_q;
+ss_ram16_adaptor #(.WIDTHAD(11), .SS_IDX(SS_IDX)) u_ss_pal (
+	.clk(clk),
+	.we_lo_in(sub_pal_wr & sub_pal_be[0]),
+	.we_hi_in(sub_pal_wr & sub_pal_be[1]),
+	.addr_in(sub_pal_addr),
+	.wdata_in(sub_pal_wdata),
+	.we_lo_out(sspl_we_lo), .we_hi_out(sspl_we_hi),
+	.addr_out(sspl_addr), .wdata_out(sspl_wdata),
+	.q_in(pal_ss_q),
+	.ssbus(ssbus)
+);
+
+wire [10:0] pal_b_addr  = pal_wr ? pal_cpu_addr   : sspl_addr;
+wire [15:0] pal_b_wdata = pal_wr ? cpu_bus_wdata  : sspl_wdata;
+wire        pal_b_we_hi = pal_wr ? pal_cpu_be[1]  : sspl_we_hi;
+wire        pal_b_we_lo = pal_wr ? pal_cpu_be[0]  : sspl_we_lo;
+
 always @(posedge clk) begin
-	if (pal_wr) begin
-		if (pal_cpu_be[1]) pal_ram_hi[pal_cpu_addr] <= cpu_bus_wdata[15:8];
-		if (pal_cpu_be[0]) pal_ram_lo[pal_cpu_addr] <= cpu_bus_wdata[7:0];
-	end else if (sub_pal_wr) begin
-		if (sub_pal_be[1]) pal_ram_hi[sub_pal_addr] <= sub_pal_wdata[15:8];
-		if (sub_pal_be[0]) pal_ram_lo[sub_pal_addr] <= sub_pal_wdata[7:0];
-	end
+	if (pal_b_we_hi) pal_ram_hi[pal_b_addr] <= pal_b_wdata[15:8];
+	if (pal_b_we_lo) pal_ram_lo[pal_b_addr] <= pal_b_wdata[7:0];
+	pal_ss_q <= {pal_ram_hi[pal_b_addr], pal_ram_lo[pal_b_addr]};
 	pal_data <= {pal_ram_hi[pal_lookup_addr], pal_ram_lo[pal_lookup_addr]};
 end
 

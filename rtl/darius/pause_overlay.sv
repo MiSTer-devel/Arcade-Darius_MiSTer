@@ -1,11 +1,32 @@
-// pause_overlay.sv — overlay pausa: dim + logo + header "PATREON" +
-// patron list scrollante (sx) + links statici (dx).
+/*  This file is part of Darius_MiSTer.
+
+    Darius_MiSTer is free software: you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+    the Free Software Foundation, either version 3 of the License, or
+    (at your option) any later version.
+
+    Darius_MiSTer is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU General Public License for more details.
+
+    You should have received a copy of the GNU General Public License
+    along with Darius_MiSTer.  If not, see <http://www.gnu.org/licenses/>.
+
+    Author: Umberto Parisi (rmonic79)
+    Version: 1.0
+    Date: 2026
+
+*/
+
+// pause_overlay.sv — pause overlay: dim + logo + "PATREON" header +
+// scrolling patron list (left) + static links (right).
 //
 // Layout 864×224:
-//   - Header "PATREON" giallo top-sx (X≈16, Y≈8)
-//   - Patron scroll bottom→top, sx del logo (X=16..344, Y=40..184)
-//   - Logo 48×48 ×3 = 144×144 al centro (X=360..504, Y=40..184)
-//   - Links statici a destra (X=520..848, Y=40..184)
+//   - "PATREON" header, yellow, top-left (X≈16, Y≈8)
+//   - Patron scroll bottom→top, left of the logo (X=16..344, Y=40..184)
+//   - Logo 48×48 ×3 = 144×144 centered (X=360..504, Y=40..184)
+//   - Static links on the right (X=520..848, Y=40..184)
 
 module pause_overlay (
 	input  wire        clk,
@@ -78,8 +99,13 @@ reg [1:0] logo_rom [0:2303] /* synthesis ramstyle = "M10K" */;
 initial $readmemb("logo/logo.mem", logo_rom);
 reg [1:0] logo_pix;
 reg       in_logo_now;
+// Pipeline addr 1 clk: spezza il path combinatorio render_x -> div3(mult) ->
+// M10K address (12ns, setup fail @96MHz). Budget pixel = 4 clk, il dato
+// resta pronto ben prima del ce_pix successivo.
+reg [11:0] logo_addr_r;
 always @(posedge clk) begin
-	logo_pix    <= logo_rom[logo_addr];
+	logo_addr_r <= logo_addr;
+	logo_pix    <= logo_rom[logo_addr_r];
 	in_logo_now <= in_logo_ahead;
 end
 
@@ -129,7 +155,7 @@ wire [1:0] patron_tier;
 pause_text #(
 	.W_CHARS       (30),
 	.H_CHARS       (18),
-	.MSG_ROWS      (40),
+	.MSG_ROWS      (64),
 	.ORIGIN_X      (10'd24),
 	.ORIGIN_Y      (9'd48),
 	.SCROLL_EN     (1),

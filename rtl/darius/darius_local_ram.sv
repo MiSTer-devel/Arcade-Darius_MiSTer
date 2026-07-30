@@ -19,9 +19,9 @@
 
 */
 
-// darius_local_ram — BRAM single-port con byte enable.
-// Split HI/LO per inference pulita M10K con byte enable.
-// Usata per main RAM, sprite RAM locale e altre RAM single-client.
+// darius_local_ram — single-port BRAM with byte enable.
+// HI/LO split for clean M10K inference with byte enable.
+// Used for main RAM, local sprite RAM and other single-client RAMs.
 
 module darius_local_ram
 #(
@@ -52,13 +52,14 @@ initial begin : init_ram
 end
 // synthesis translate_on
 
+// Lettura non gated (come le RAM di BoogieWings): rdata segue addr con 1 clk
+// di latenza — necessario per ss_ram16_adaptor (legge via addr_out senza rd);
+// per la CPU equivalente (campiona rdata solo nei propri cicli di read).
 always @(posedge clk) begin
 	if (wr && be[1]) ram_hi[addr] <= wdata[15:8];
 	if (wr && be[0]) ram_lo[addr] <= wdata[7:0];
-	if (rd) begin
-		rdata_hi <= ram_hi[addr];
-		rdata_lo <= ram_lo[addr];
-	end
+	rdata_hi <= ram_hi[addr];
+	rdata_lo <= ram_lo[addr];
 end
 
 assign rdata = {rdata_hi, rdata_lo};

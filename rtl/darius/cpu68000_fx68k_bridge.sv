@@ -47,6 +47,7 @@ module cpu68000_fx68k_bridge
 	output wire [1:0]  fx_dsn,       // {UDSn, LDSn} directly from FX68K
 	output reg  [15:0] last_read,
 	output wire [23:0] dbg_pc,
+	output wire [2:0]  fc_out,       // function code FX68K reale (per ss_m68k)
 	output wire        iack
 );
 
@@ -81,6 +82,7 @@ wire bus_req  = (~fx_as_n) & lane_sel;
 wire bus_rd_w = bus_req & fx_rw & ~iack_cycle;
 wire bus_wr_w = bus_req & ~fx_rw & ~iack_cycle;
 wire [2:0] fx_fc = {fx_fc2, fx_fc1, fx_fc0};
+assign fc_out = fx_fc;
 wire prog_fetch_w = bus_rd_w && ((fx_fc == 3'b010) || (fx_fc == 3'b110));
 reg  [23:0] dbg_pc_reg;
 

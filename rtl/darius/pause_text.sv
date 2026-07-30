@@ -1,20 +1,41 @@
-// pause_text.sv — Renderer testo BRAM-based per overlay pause.
+/*  This file is part of Darius_MiSTer.
+
+    Darius_MiSTer is free software: you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+    the Free Software Foundation, either version 3 of the License, or
+    (at your option) any later version.
+
+    Darius_MiSTer is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU General Public License for more details.
+
+    You should have received a copy of the GNU General Public License
+    along with Darius_MiSTer.  If not, see <http://www.gnu.org/licenses/>.
+
+    Author: Umberto Parisi (rmonic79)
+    Version: 1.0
+    Date: 2026
+
+*/
+
+// pause_text.sv — BRAM-based text renderer for the pause overlay.
 //
-// Genera un layer di char (font 8x8) su un'area rettangolare dello schermo
-// (W_CHARS x H_CHARS char) leggendo da una BRAM init-da-file (.mem).
+// Generates a char layer (8x8 font) over a rectangular screen area
+// (W_CHARS x H_CHARS chars) reading from a file-initialized BRAM (.mem).
 //
-// Modalità:
-//   SCROLL_EN=0: testo statico, BRAM contiene esattamente W_CHARS×H_CHARS byte ASCII.
-//   SCROLL_EN=1: testo scrolla verticalmente bottom→top, BRAM contiene
-//                W_CHARS × MSG_ROWS char ASCII (MSG_ROWS può essere > H_CHARS).
-//                Velocità: 1 pixel ogni SCROLL_PERIOD frame.
+// Modes:
+//   SCROLL_EN=0: static text, BRAM holds exactly W_CHARS×H_CHARS ASCII bytes.
+//   SCROLL_EN=1: text scrolls vertically bottom→top, BRAM holds
+//                W_CHARS × MSG_ROWS ASCII chars (MSG_ROWS may be > H_CHARS).
+//                Speed: 1 pixel every SCROLL_PERIOD frames.
 //
-// Output: pixel_on = 1 quando il pixel del char a (render_x, render_y) è acceso.
-//         Caller mixa con palette esterna.
+// Output: pixel_on = 1 when the char pixel at (render_x, render_y) is lit.
+//         Caller mixes with an external palette.
 //
-// Costo BRAM:
-//   font_rom: 1024 byte = 1 M10K (condiviso tra istanze tramite parameter FONT_FILE)
-//   msg_rom:  W_CHARS × MSG_ROWS byte (1 M10K se < ~4 KB)
+// BRAM cost:
+//   font_rom: 1024 bytes = 1 M10K (shared across instances via FONT_FILE parameter)
+//   msg_rom:  W_CHARS × MSG_ROWS bytes (1 M10K if < ~4 KB)
 
 module pause_text #(
 	parameter        W_CHARS      = 41,           // larghezza area in char (8 px ciascuno)

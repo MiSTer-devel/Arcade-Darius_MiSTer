@@ -63,7 +63,15 @@ module pc060ha_link (
 	output wire       snd_reset,    // reset to audio Z80s
 	// Debug
 	output wire [1:0] dbg_snd_full,
-	output wire [1:0] dbg_main_full
+	output wire [1:0] dbg_main_full,
+
+	// [SS-HOOK] Savestate: handshake main<->sound (46 bit). Senza ripristino,
+	// al restore l'handshake e' desincronizzato dallo stato Z80 -> il comando
+	// musicale in corso e' perso -> musica muta finche' il 68k non ne manda un
+	// altro. Rimozione: ss_ld=0 (a riposo l'output e' passivo).
+	output wire [45:0] ss_out,
+	input  wire        ss_ld,
+	input  wire [45:0] ss_in
 );
 
 // Pointer registers
@@ -84,6 +92,11 @@ reg [3:0] share_ram [0:7];
 
 // Status word
 wire [3:0] status = {main_full, snd_full};
+
+// [SS-HOOK] snapshot stato handshake (46 bit): ptr+full+flag+share_ram
+assign ss_out = {main_ptr, snd_ptr, snd_full, main_full, main_flag, snd_flag,
+                 share_ram[7], share_ram[6], share_ram[5], share_ram[4],
+                 share_ram[3], share_ram[2], share_ram[1], share_ram[0]};
 
 // NMI and reset outputs
 assign snd_nmi_n = snd_flag | (snd_full[1:0] == 2'b00);
@@ -118,6 +131,11 @@ always @(posedge clk) begin
 		snd_cs_prev  <= 1'b0;
 		main_wr_lat <= 0; main_rd_lat <= 0; main_addr_lat <= 0;
 		snd_wr_lat  <= 0; snd_rd_lat  <= 0; snd_addr_lat  <= 0;
+	end else if (ss_ld) begin
+		// [SS-HOOK] restore: ricarica lo stato handshake (CPU ferme)
+		{main_ptr, snd_ptr, snd_full, main_full, main_flag, snd_flag,
+		 share_ram[7], share_ram[6], share_ram[5], share_ram[4],
+		 share_ram[3], share_ram[2], share_ram[1], share_ram[0]} <= ss_in;
 	end else begin
 		main_cs_prev <= main_cs;
 		snd_cs_prev  <= snd_cs;
@@ -145,22 +163,35 @@ always @(posedge clk) begin
 				main_ptr <= main_wdata_lat[3:0];
 			end else begin
 				// Comm access (addr=1) or port read
-				if (!main_ptr[2]) main_ptr <= main_ptr + 4'd1;
-				// RAM write: all ptr with ptr[2]=0, comm write (like JTCORES ram_we)
-				if (main_wr_lat && main_addr_lat && !main_ptr[2])
-					share_ram[{1'b0, main_ptr[1:0]}] <= main_wdata_lat[3:0];
+				// Back-pressure: if snd_full[ch] is already 1, REJECT main writes to that
+				// channel's RAM and don't re-assert flag. Sim verified: senza questo, due
+				// sound_code consecutivi (PAN + SE) collidono e il primo è sovrascritto.
+				if (!main_ptr[2]) begin
+					if (main_wr_lat && main_addr_lat) begin
+						if ((main_ptr[1:0] == 2'd0 || main_ptr[1:0] == 2'd1) && snd_full[0]) begin
+							// busy ch0 — drop write
+						end else if ((main_ptr[1:0] == 2'd2 || main_ptr[1:0] == 2'd3) && snd_full[1]) begin
+							// busy ch1 — drop write
+						end else begin
+							share_ram[{1'b0, main_ptr[1:0]}] <= main_wdata_lat[3:0];
+							main_ptr <= main_ptr + 4'd1;
+						end
+					end else begin
+						main_ptr <= main_ptr + 4'd1;
+					end
+				end
 				// Flag/full logic per ptr value
 				case (main_ptr)
 					4'd1: begin
-						if (main_wr_lat)
-							snd_full[0] <= 1'b1;    // signal TO sound
-						else
+						if (main_wr_lat && !snd_full[0])
+							snd_full[0] <= 1'b1;    // signal TO sound (only if not busy)
+						else if (!main_wr_lat)
 							main_full[0] <= 1'b0;   // ack FROM sound
 					end
 					4'd3: begin
-						if (main_wr_lat)
-							snd_full[1] <= 1'b1;    // signal TO sound
-						else
+						if (main_wr_lat && !snd_full[1])
+							snd_full[1] <= 1'b1;    // signal TO sound (only if not busy)
+						else if (!main_wr_lat)
 							main_full[1] <= 1'b0;   // ack FROM sound
 					end
 					4'd4: if (main_wr_lat) main_flag <= main_wdata_lat[0];

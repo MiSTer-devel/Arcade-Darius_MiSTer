@@ -35,9 +35,13 @@
 // SDRAM word = {plane3[7:0], plane2[7:0], plane1[7:0], plane0[7:0]}
 // draw_sprites called with x_offs=xoffs (scroll-dependent), y_offs=-8
 
-module darius_sprite_renderer (
+module darius_sprite_renderer #(
+	parameter SS_IDX = -1      // savestate: indice slave OBJ RAM locale (pattern F2)
+) (
 	input  wire        clk,
 	input  wire        reset,
+	// Savestate (pattern F2: ssbus dentro al chip) — OBJ RAM locale snooped
+	ssbus_if.slave     ssbus,
 	input  wire  [9:0] render_x,
 	input  wire  [8:0] render_y,
 
@@ -77,7 +81,11 @@ module darius_sprite_renderer (
 	output wire [23:0] sprite_rgb,
 	output wire  [1:0] sprite_prio,
 	output wire        sprite_opaque,
-	output wire [12:0] dbg_disp_word
+	output wire [12:0] dbg_disp_word,
+
+	// Follow-cam: tracking navicella
+	output reg   [9:0] ship_x,      // ultima X valida (coord. schermo)
+	output reg         ship_commit  // pulse 1 clk a ogni aggiornamento
 );
 
 localparam H_ACTIVE = 10'd864;
@@ -126,15 +134,133 @@ wire [15:0] spr_wr_data  = main_spr_wr ? cpu_bus_wdata : sub_bus_wdata;
 wire [1:0]  spr_wr_be    = main_spr_wr ? ~cpu_bus_dsn : ~sub_bus_dsn;
 (* ramstyle = "no_rw_check" *) reg [7:0] spr_ram_hi [0:2047];
 (* ramstyle = "no_rw_check" *) reg [7:0] spr_ram_lo [0:2047];
+// DOUBLE BUFFER OBJ RAM (portato da Darius2NinjaWarriors): la CPU (main+sub)
+// scrive la primaria (live); il renderer legge la copia "frozen". Copia atomica
+// live->frozen durante il vblank -> il frame disegna uno stato COERENTE congelato
+// a inizio frame -> nessuna race mid-frame (aggiornamento CPU intraframe non
+// spezza piu' le scanline: appare dal frame successivo, come sull'HW Taito).
+(* ramstyle = "no_rw_check" *) reg [7:0] spr_ram_hi_frozen [0:2047];
+(* ramstyle = "no_rw_check" *) reg [7:0] spr_ram_lo_frozen [0:2047];
 reg  [7:0] spr_rdata_hi, spr_rdata_lo;
 reg [10:0] spr_rd_addr;
 wire [15:0] spr_rdata = {spr_rdata_hi, spr_rdata_lo};
 
+// Savestate: adaptor sulla porta di scrittura snoop (CPU ferme durante SS);
+// gather-read sull'indirizzo muxato della stessa porta. FSM di scan legge
+// dall'altra porta: 2 porte totali = M10K TDP.
+wire        ssob_we_lo, ssob_we_hi;
+wire [10:0] ssob_addr;
+wire [15:0] ssob_wdata;
+reg  [15:0] spr_ram_ss_q;
+ss_ram16_adaptor #(.WIDTHAD(11), .SS_IDX(SS_IDX)) u_ss_objram (
+	.clk(clk),
+	.we_lo_in(spr_wr & spr_wr_be[0]),
+	.we_hi_in(spr_wr & spr_wr_be[1]),
+	.addr_in(spr_wr_addr),
+	.wdata_in(spr_wr_data),
+	.we_lo_out(ssob_we_lo), .we_hi_out(ssob_we_hi),
+	.addr_out(ssob_addr), .wdata_out(ssob_wdata),
+	.q_in(spr_ram_ss_q),
+	.ssbus(ssbus)
+);
+
+// Port A LIVE: scrittura CPU (snoop via adaptor) + gather-read savestate.
+// Il savestate legge/scrive la LIVE (lo stato "vero" del gioco).
 always @(posedge clk) begin
-	if (spr_wr && spr_wr_be[1]) spr_ram_hi[spr_wr_addr] <= spr_wr_data[15:8];
-	if (spr_wr && spr_wr_be[0]) spr_ram_lo[spr_wr_addr] <= spr_wr_data[7:0];
-	spr_rdata_hi <= spr_ram_hi[spr_rd_addr];
-	spr_rdata_lo <= spr_ram_lo[spr_rd_addr];
+	if (ssob_we_hi) spr_ram_hi[ssob_addr] <= ssob_wdata[15:8];
+	if (ssob_we_lo) spr_ram_lo[ssob_addr] <= ssob_wdata[7:0];
+	spr_ram_ss_q <= {spr_ram_hi[ssob_addr], spr_ram_lo[ssob_addr]};
+end
+
+// Copy LIVE -> FROZEN durante vblank (render_y >= V_ACTIVE). Un'entry/clk,
+// 0..2047. All'ingresso vblank riparte; al reset copy_done=0 forza la prima
+// copia completa prima di partire in active. Vblank Darius ~38 righe x ~6108
+// clk >> 2048 -> copia sempre completata prima del display.
+reg [10:0] copy_idx;
+reg        copy_done;
+reg  [8:0] prev_render_y_copy;
+wire vblank_copy = (render_y >= V_ACTIVE);
+always @(posedge clk) begin
+	if (reset) begin
+		copy_idx <= 11'd0;
+		copy_done <= 1'b0;
+		prev_render_y_copy <= 9'h1FF;
+	end else begin
+		prev_render_y_copy <= render_y;
+		// ingresso vblank: (ri)parte la copia
+		if (vblank_copy && !(prev_render_y_copy >= V_ACTIVE)) begin
+			copy_idx  <= 11'd0;
+			copy_done <= 1'b0;
+		end
+		if (!copy_done && vblank_copy) begin
+			if (copy_idx == 11'd2047) copy_done <= 1'b1;
+			else                      copy_idx  <= copy_idx + 11'd1;
+		end
+	end
+end
+
+// Port A FROZEN: copy write live->frozen in vblank.
+// Port B FROZEN: il renderer (FSM scan) legge da qui (no race con CPU writes).
+always @(posedge clk) begin
+	if (!copy_done) spr_ram_hi_frozen[copy_idx] <= spr_ram_hi[copy_idx];
+	spr_rdata_hi <= spr_ram_hi_frozen[spr_rd_addr];
+end
+always @(posedge clk) begin
+	if (!copy_done) spr_ram_lo_frozen[copy_idx] <= spr_ram_lo[copy_idx];
+	spr_rdata_lo <= spr_ram_lo_frozen[spr_rd_addr];
+end
+
+// [PERF] max slot OBJ RAM scritto dalla CPU: lo scan parte da qui invece che da
+// 479 -> scan piu' corto -> draw finisce prima -> meno sfori (= meno linee ripetute).
+// Monotono (OBJ riscritta ogni frame). NON cambia cosa viene disegnato.
+reg [8:0] max_idx_used;
+always @(posedge clk) begin
+	if (reset) max_idx_used <= 9'd0;
+	else if (spr_wr && (spr_wr_addr[10:2] > max_idx_used))
+		max_idx_used <= spr_wr_addr[10:2];
+end
+
+// =====================================================================
+// Follow-cam: snoop entry navicella
+// =====================================================================
+// Nave = slot 7 ($E00138), code $3E5-$3E7 (rotazione fiamma).
+// Verificato: MAME attract (slot 7 = code $3E6 128/128 frame demo) +
+// Darius-Native main_annotated.md ("La nave è a $E00138, code $3E6").
+// Word addr 0-based (base $080): X = $E0013A -> 11'h01D, code = $E0013C -> 11'h01E.
+// Commit order-independent (clear di frame scrive X=$380/code=0 prima del
+// rewrite): X candidata filtrata dal valore park $380 (>=880 = offscreen),
+// commit su write X con code valido O su write code valido con X plausibile.
+localparam [10:0] SHIP_X_WADDR    = 11'h01D;
+localparam [10:0] SHIP_CODE_WADDR = 11'h01E;
+
+reg [9:0] ship_cand_x;
+reg       ship_code_ok;
+wire      wr_x_plausible  = spr_wr_data[9:0] < 10'd880;
+wire      cand_plausible  = ship_cand_x < 10'd880;
+wire      wr_code_is_ship = (spr_wr_data[12:0] >= 13'h03E5) && (spr_wr_data[12:0] <= 13'h03E7);
+
+always @(posedge clk) begin
+	ship_commit <= 1'b0;
+	if (reset) begin
+		ship_cand_x  <= 10'd880;
+		ship_code_ok <= 1'b0;
+		ship_x       <= 10'd432;
+	end else if (spr_wr) begin
+		if (spr_wr_addr == SHIP_X_WADDR) begin
+			ship_cand_x <= spr_wr_data[9:0];
+			if (ship_code_ok && wr_x_plausible) begin
+				ship_x      <= spr_wr_data[9:0];
+				ship_commit <= 1'b1;
+			end
+		end
+		if (spr_wr_addr == SHIP_CODE_WADDR) begin
+			ship_code_ok <= wr_code_is_ship;
+			if (wr_code_is_ship && cand_plausible) begin
+				ship_x      <= ship_cand_x;
+				ship_commit <= 1'b1;
+			end
+		end
+	end
 end
 
 // =====================================================================
@@ -222,228 +348,298 @@ function automatic [3:0] spr_get_pixel;
 endfunction
 
 // =====================================================================
-// Scan + render FSM
+// SCAN-OMBRA + FIFO (portato da NightSlashers boogwings_sprites, adattato a
+// Darius): la scansione della OBJ RAM (Y/X/code/attr per ~480 slot) e' una FSM
+// SEPARATA che accoda i MATCH in una FIFO, in PARALLELO al draw. Prima lo scan
+// era dentro la FSM di draw (seriale: 3 clk/slot solo per testare Y, 9 se in
+// banda) -> su frame densi il draw sforava la scanline -> il double-buffer
+// perdeva new_line -> LINEA RIPETUTA. Con la scan-ombra il draw drena solo la
+// FIFO e finisce in tempo -> new_line mai perso -> niente ripetizione.
+//
+// SINCRONIA INVARIATA: il double-buffer resta ancorato a render_y/new_line
+// (come prima, a Darius NON si sfasa). Cambia SOLO la sorgente degli sprite del
+// draw: FIFO invece di scan inline. Pixel/priorita' bit-identici (stesso ordine
+// max_idx_used->0, stesso spr_get_pixel, stesso line buffer).
 // =====================================================================
 reg  [8:0] prev_render_y;
 wire new_line = in_active && (render_y != prev_render_y);
 
-// Scan state
-localparam S_IDLE     = 4'd0;
-localparam S_CLEAR    = 4'd1;
-localparam S_READ_Y   = 4'd2;
-localparam S_LATCH_Y  = 4'd3;
-localparam S_READ_X   = 4'd4;
-localparam S_LATCH_X  = 4'd5;
-localparam S_READ_CODE = 4'd6;
-localparam S_LATCH_CODE = 4'd7;
-localparam S_READ_ATTR = 4'd8;
-localparam S_CHECK    = 4'd9;
-localparam S_FETCH_ROM = 4'd10;
-localparam S_WAIT_ROM = 4'd11;
-localparam S_DRAW     = 4'd12;
-localparam S_NEXT     = 4'd13;
-localparam S_WAIT_Y   = 4'd14;  // BRAM latency wait for Y word
+// ---- FSM di DRAW (consuma la FIFO) ----
+localparam D_IDLE      = 3'd0;
+localparam D_CLEAR     = 3'd1;
+localparam D_POP       = 3'd2;   // preleva un match dalla FIFO
+localparam D_FETCH_ROM = 3'd3;
+localparam D_WAIT_ROM  = 3'd4;
+localparam D_DRAW      = 3'd5;
+localparam D_NEXT      = 3'd6;
 
-reg  [3:0] scan_state;
-reg  [8:0] scan_idx;       // sprite index (0-479 max)
+reg  [2:0] draw_state;
 reg  [9:0] clear_addr;
-reg  [8:0] prep_line_y;    // line being prepared
+reg  [8:0] prep_line_y;    // line being prepared (dal draw: render_y+1 su new_line)
 
-// Sprite attributes
-reg  [8:0] cur_sy;
-reg signed [10:0] cur_sx;
-reg [12:0] cur_code;
-reg        cur_flipx, cur_flipy;
-reg  [6:0] cur_color;
-reg        cur_prio;
-reg [31:0] cur_romdata;
+// ---- FSM di SCAN (riempie la FIFO) ----
+localparam SC_IDLE    = 4'd0;
+localparam SC_READ_Y  = 4'd1;
+localparam SC_WAIT_Y  = 4'd2;
+localparam SC_LATCH_Y = 4'd3;
+localparam SC_READ_X  = 4'd4;
+localparam SC_LATCH_X = 4'd5;
+localparam SC_READ_CODE = 4'd6;
+localparam SC_LATCH_CODE = 4'd7;
+localparam SC_READ_ATTR = 4'd8;   // = wait attr
+localparam SC_PUSH    = 4'd9;
+
+reg  [3:0] sc_state;
+reg  [8:0] sc_idx;         // sprite index (max_idx_used .. 0)
+reg  [8:0] sc_line_y;      // linea che lo scan sta preparando (= prep_line_y latchata a start)
+reg        sc_run;         // scan attivo per la linea corrente
+
+// registri di decode dello scan (equivalenti ai vecchi cur_*)
+reg signed [10:0] sc_sx;
+reg [12:0] sc_code;
+reg        sc_flipx, sc_flipy;
+reg  [6:0] sc_color;
+reg        sc_prio;
+reg  [3:0] sc_row_diff_hit;
+reg  [3:0] sc_draw_row;
+
+// ---- FIFO match scan->draw ----
+// entry = {sx[10:0], code[12:0], flipx, color[6:0], prio, draw_row[3:0]} = 37 bit.
+// MLAB (come NS): la FIFO scan->render in M10K aveva race read-during-write sul
+// ferro; MLAB (LUTRAM write-through) la elimina. 64 entry >> sprite/linea reali.
+localparam FF_W = 37;
+(* ramstyle = "MLAB" *) reg [FF_W-1:0] mfifo [0:63];
+reg  [6:0] mf_w, mf_r;     // 7-bit (bit alto = wrap) su 64 entry
+reg [FF_W-1:0] mf_q_r;
+reg        mf_empty_d;
+wire       mf_empty = (mf_w == mf_r);
+wire       mf_full  = (mf_w[6] != mf_r[6]) && (mf_w[5:0] == mf_r[5:0]);
 
 // Draw state
+reg signed [10:0] cur_sx;
+reg [12:0] cur_code;
+reg        cur_flipx;
+reg  [6:0] cur_color;
+reg        cur_prio;
+reg  [3:0] draw_row_in_spr;
+reg [31:0] cur_romdata;
 reg  [3:0] draw_pix;       // pixel counter within row (0-15)
-reg  [3:0] draw_row_in_spr; // which row of sprite hits this line
-reg  [3:0] row_diff_hit;
 
+// FIFO read registrata (MLAB): mf_q_r valido perche' mf_r fermo da >=1 ciclo;
+// mf_empty_d (ritardato) = guardia read-during-write (pop solo entry scritte >=1 ck).
+always @(posedge clk) begin
+	mf_q_r     <= mfifo[mf_r[5:0]];
+	mf_empty_d <= mf_empty;
+end
+
+// =====================================================================
+// FSM di SCAN (scan-ombra): scandisce la OBJ RAM, accoda i match in FIFO.
+// Usa la porta di lettura OBJ RAM (spr_rd_addr/spr_rdata). Gira in parallelo
+// alla FSM di draw. Ordine max_idx_used->0 = identico a prima (first-wins).
+// =====================================================================
+always @(posedge clk) begin
+	if (reset) begin
+		sc_state <= SC_IDLE;
+		sc_idx   <= 0;
+		sc_run   <= 1'b0;
+		mf_w     <= 7'd0;
+	end else begin
+		// Start scan quando il draw inizia a preparare una nuova linea (D_CLEAR).
+		// sc_line_y = prep_line_y latchata; mf_w azzerato = FIFO ripartita per la linea.
+		if (new_line) begin
+			sc_line_y <= (render_y >= V_ACTIVE - 9'd1) ? 9'd0 : render_y + 9'd1;
+			sc_idx    <= max_idx_used;
+			mf_w      <= 7'd0;
+			sc_run    <= 1'b1;
+			sc_state  <= SC_READ_Y;
+		end else begin
+			case (sc_state)
+				SC_IDLE: ; // attende new_line
+
+				SC_READ_Y: begin
+					spr_rd_addr <= {sc_idx, 2'b00};
+					sc_state    <= SC_WAIT_Y;
+				end
+
+				SC_WAIT_Y: sc_state <= SC_LATCH_Y;  // BRAM latency
+
+				SC_LATCH_Y: begin
+					reg [8:0] sy_calc;
+					reg [8:0] row_diff;
+					sy_calc = (9'd256 - spr_rdata[8:0] - 9'd16 + spr_yoff[8:0]) & 9'h1FF;
+					row_diff = (sc_line_y - sy_calc) & 9'h1FF;
+					if (row_diff < 9'd16) begin
+						sc_row_diff_hit <= row_diff[3:0];
+						spr_rd_addr     <= {sc_idx, 2'b01};
+						sc_state        <= SC_READ_X;
+					end else begin
+						// non in banda Y: prossimo slot
+						if (sc_idx == 9'd0) begin sc_run <= 1'b0; sc_state <= SC_IDLE; end
+						else begin sc_idx <= sc_idx - 9'd1; sc_state <= SC_READ_Y; end
+					end
+				end
+
+				SC_READ_X: sc_state <= SC_LATCH_X;
+
+				SC_LATCH_X: begin
+					begin
+						reg signed [10:0] sx_raw;
+						sx_raw = {1'b0, spr_rdata[9:0]} - {1'b0, x_offset} + spr_xoff;
+						sc_sx <= (sx_raw > 11'sd900) ? (sx_raw - 11'sd1024) : sx_raw;
+					end
+					spr_rd_addr <= {sc_idx, 2'b10};
+					sc_state    <= SC_READ_CODE;
+				end
+
+				SC_READ_CODE: sc_state <= SC_LATCH_CODE;
+
+				SC_LATCH_CODE: begin
+					sc_code  <= spr_rdata[12:0];
+					sc_flipx <= spr_rdata[14];
+					sc_flipy <= spr_rdata[15];
+					spr_rd_addr <= {sc_idx, 2'b11};
+					sc_state <= SC_READ_ATTR;
+				end
+
+				SC_READ_ATTR: sc_state <= SC_PUSH;  // wait attr word
+
+				SC_PUSH: begin
+					reg [3:0] draw_row;
+					sc_color <= spr_rdata[6:0];
+					sc_prio  <= spr_rdata[7];
+					draw_row = sc_flipy ? (4'd15 - sc_row_diff_hit) : sc_row_diff_hit;
+					// push solo se code!=0 e c'e' spazio; entry = {sx,code,flipx,color,prio,row}
+					if (sc_code != 13'd0 && !mf_full) begin
+						mfifo[mf_w[5:0]] <= {sc_sx, sc_code, sc_flipx, spr_rdata[6:0], spr_rdata[7], draw_row};
+						mf_w <= mf_w + 7'd1;
+					end
+					// se FIFO piena e code!=0: stallo qui finche' il draw drena
+					if (sc_code != 13'd0 && mf_full) begin
+						sc_state <= SC_PUSH;
+					end else begin
+						if (sc_idx == 9'd0) begin sc_run <= 1'b0; sc_state <= SC_IDLE; end
+						else begin sc_idx <= sc_idx - 9'd1; sc_state <= SC_READ_Y; end
+					end
+				end
+
+				default: sc_state <= SC_IDLE;
+			endcase
+		end
+	end
+end
+
+// scan_done = lo scan ha finito TUTTI gli slot per la linea corrente.
+wire scan_done = ~sc_run;
+
+// =====================================================================
+// FSM di DRAW: consuma la FIFO, fetch ROM, disegna nel double-buffer.
+// Display/sincronia INVARIATI: swap a new_line, line buffer 2-buffer.
+// =====================================================================
 always @(posedge clk) begin
 	lb_we <= 1'b0;
 	spriterom_req <= 1'b0;
 
 	if (reset) begin
 		prev_render_y <= 9'h1FF;
-		scan_state    <= S_IDLE;
-		scan_idx      <= 0;
+		draw_state    <= D_IDLE;
 		clear_addr    <= 0;
 		spr_disp_sel  <= 0;
 		lb_buf_sel    <= 1;
 		prep_line_y   <= 0;
+		mf_r          <= 7'd0;
 	end else begin
 		if (new_line) prev_render_y <= render_y;
 
-		case (scan_state)
-			S_IDLE: begin
-				if (new_line) begin
-					// Swap buffers and start preparing next line
-					spr_disp_sel <= lb_buf_sel;
-					lb_buf_sel   <= ~lb_buf_sel;
-					prep_line_y  <= (render_y >= V_ACTIVE - 9'd1) ? 9'd0 : render_y + 9'd1;
-					clear_addr   <= 0;
-					scan_state   <= S_CLEAR;
-				end
-			end
+		// new_line: swap buffer + reset draw per la nuova linea (come prima, ma
+		// ora anche se il draw non aveva finito -> nessun new_line perso).
+		if (new_line) begin
+			spr_disp_sel <= lb_buf_sel;
+			lb_buf_sel   <= ~lb_buf_sel;
+			prep_line_y  <= (render_y >= V_ACTIVE - 9'd1) ? 9'd0 : render_y + 9'd1;
+			clear_addr   <= 0;
+			mf_r         <= 7'd0;   // riparte a drenare la FIFO della nuova linea
+			draw_state   <= D_CLEAR;
+		end else begin
+			case (draw_state)
+				D_IDLE: ; // attende new_line
 
-			// Clear the write buffer
-			S_CLEAR: begin
-				lb_we    <= 1'b1;
-				lb_waddr <= clear_addr;
-				lb_wdata <= 13'd0;
-				if (clear_addr == H_ACTIVE - 10'd1) begin
-					scan_idx   <= 9'd479;  // draw order: 479→0 (first sprite wins)
-					scan_state <= S_READ_Y;
-				end else
-					clear_addr <= clear_addr + 10'd1;
-			end
-
-			// Read sprite entry word 0 (Y)
-			S_READ_Y: begin
-				spr_rd_addr <= {scan_idx, 2'b00};
-				scan_state  <= S_WAIT_Y;
-			end
-
-			S_WAIT_Y: begin
-				// BRAM latency: addr registered at S_READ_Y, data available now
-				scan_state <= S_LATCH_Y;
-			end
-
-			S_LATCH_Y: begin
-				reg [8:0] sy_calc;
-				reg [8:0] row_diff;
-				sy_calc = (9'd256 - spr_rdata[8:0] - 9'd16 + spr_yoff[8:0]) & 9'h1FF;  // MAME y_offs=-8, +8 north
-				row_diff = (prep_line_y - sy_calc) & 9'h1FF;
-				cur_sy <= sy_calc;
-				if (row_diff < 9'd16) begin
-					row_diff_hit <= row_diff[3:0];
-					spr_rd_addr  <= {scan_idx, 2'b01};
-					scan_state   <= S_READ_X;
-				end else begin
-					scan_state <= S_NEXT;
-				end
-			end
-
-			// Read word 1 (X)
-			S_READ_X: begin
-				scan_state <= S_LATCH_X;
-			end
-
-			S_LATCH_X: begin
-				// MAME: curx = sx - x_offs; if (curx > 900) curx -= 1024;
-				begin
-					reg signed [10:0] sx_raw;
-					sx_raw = {1'b0, spr_rdata[9:0]} - {1'b0, x_offset} + spr_xoff;
-					cur_sx <= (sx_raw > 11'sd900) ? (sx_raw - 11'sd1024) : sx_raw;
-				end
-				spr_rd_addr <= {scan_idx, 2'b10};
-				scan_state <= S_READ_CODE;
-			end
-
-			// Read word 2 (code + flip)
-			S_READ_CODE: begin
-				scan_state <= S_LATCH_CODE;
-			end
-
-			S_LATCH_CODE: begin
-				cur_code  <= spr_rdata[12:0];
-				cur_flipx <= spr_rdata[14];
-				cur_flipy <= spr_rdata[15];
-				spr_rd_addr <= {scan_idx, 2'b11};
-				scan_state <= S_READ_ATTR;
-			end
-
-			// Read word 3 (color + priority)
-			S_READ_ATTR: begin
-				scan_state <= S_CHECK;
-			end
-
-			// Check if sprite is on this line
-			S_CHECK: begin
-				cur_color <= spr_rdata[6:0];
-				cur_prio  <= spr_rdata[7];
-
-				if (cur_code != 13'd0) begin
-					draw_row_in_spr <= cur_flipy ? (4'd15 - row_diff_hit) : row_diff_hit;
-					scan_state <= S_FETCH_ROM;
-				end else begin
-					scan_state <= S_NEXT;
-				end
-			end
-
-			// Fetch sprite ROM data for this row
-			S_FETCH_ROM: begin
-				// Sprite ROM address calculation:
-				// Each sprite = 128 bytes = 32 words (16-bit) = 16 words (32-bit)
-				// 4 quadrants: TL(rows 0-7, cols 0-7), TR(rows 0-7, cols 8-15),
-				//              BL(rows 8-15, cols 0-7), BR(rows 8-15, cols 8-15)
-				// Each quadrant = 8 rows × 1 word/row = 8 words (32-bit)
-				//
-				// For row R in sprite:
-				//   if R < 8: quadrant = TL (word offset 0) for cols 0-7
-				//   if R >= 8: quadrant = BL (word offset 16) for cols 0-7
-				//   Right half: +8 words
-				//
-				// Byte address = sprite_code × 128 + quadrant_offset + row_in_quad × 4
-				// We fetch left half first, then right half in S_DRAW
-
-				// Left half address
-				spriterom_addr <= {cur_code, draw_row_in_spr[3], 1'b0, draw_row_in_spr[2:0], 2'b00};
-				spriterom_req  <= 1'b1;
-				draw_pix       <= 0;
-				scan_state     <= S_WAIT_ROM;
-			end
-
-			S_WAIT_ROM: begin
-				if (spriterom_valid) begin
-					cur_romdata <= spriterom_data;
-					scan_state  <= S_DRAW;
-				end
-			end
-
-			// Draw 8 pixels from current ROM word (bit-per-plane, MAME method)
-			S_DRAW: begin
-				reg [3:0] pixel;
-				reg signed [10:0] draw_x;
-
-				pixel = spr_get_pixel(cur_romdata, cur_flipx, draw_pix[2:0]);
-				draw_x = cur_flipx ? (cur_sx + (11'sd15 - {7'd0, draw_pix})) : (cur_sx + {7'd0, draw_pix});
-
-				if (pixel != 4'd0 && draw_x >= 0 && draw_x < $signed({1'b0, H_ACTIVE})) begin
+				// Clear the write buffer
+				D_CLEAR: begin
 					lb_we    <= 1'b1;
-					lb_waddr <= draw_x[9:0];
-					lb_wdata <= {1'b0, cur_prio, cur_color, pixel};
+					lb_waddr <= clear_addr;
+					lb_wdata <= 13'd0;
+					if (clear_addr == H_ACTIVE - 10'd1)
+						draw_state <= D_POP;
+					else
+						clear_addr <= clear_addr + 10'd1;
 				end
 
-				if (draw_pix == 4'd7) begin
-					// Fetch right half
-					spriterom_addr <= {cur_code, draw_row_in_spr[3], 1'b1, draw_row_in_spr[2:0], 2'b00};
+				// Pop next match from FIFO (guardia RDW: mf_empty_d).
+				D_POP: begin
+					if (!mf_empty && !mf_empty_d) begin
+						cur_sx          <= mf_q_r[36:26];
+						cur_code        <= mf_q_r[25:13];
+						cur_flipx       <= mf_q_r[12];
+						cur_color       <= mf_q_r[11:5];
+						cur_prio        <= mf_q_r[4];
+						draw_row_in_spr <= mf_q_r[3:0];
+						mf_r  <= mf_r + 7'd1;
+						draw_state <= D_FETCH_ROM;
+					end else if (mf_empty && scan_done) begin
+						// FIFO vuota e scan finito: linea completa, attende new_line
+						draw_state <= D_IDLE;
+					end
+					// FIFO vuota ma scan in corso: attendi qui
+				end
+
+				// Fetch left half (byte addr = code*128 + quadrant + row*4)
+				D_FETCH_ROM: begin
+					spriterom_addr <= {cur_code, draw_row_in_spr[3], 1'b0, draw_row_in_spr[2:0], 2'b00};
 					spriterom_req  <= 1'b1;
-					draw_pix       <= 4'd8;
-					scan_state     <= S_WAIT_ROM;
-				end else if (draw_pix == 4'd15) begin
-					scan_state <= S_NEXT;
-				end else begin
-					draw_pix <= draw_pix + 4'd1;
+					draw_pix       <= 0;
+					draw_state     <= D_WAIT_ROM;
 				end
-			end
 
-			// Advance to next sprite
-			S_NEXT: begin
-				if (scan_idx == 9'd0) begin
-					scan_state <= S_IDLE;
-				end else begin
-					scan_idx   <= scan_idx - 9'd1;  // draw order: 479→0
-					scan_state <= S_READ_Y;
+				D_WAIT_ROM: begin
+					if (spriterom_valid) begin
+						cur_romdata <= spriterom_data;
+						draw_state  <= D_DRAW;
+					end
 				end
-			end
 
-			default: scan_state <= S_IDLE;
-		endcase
+				// Draw 8 pixels from current ROM word (bit-per-plane, MAME method)
+				D_DRAW: begin
+					reg [3:0] pixel;
+					reg signed [10:0] draw_x;
+
+					pixel = spr_get_pixel(cur_romdata, cur_flipx, draw_pix[2:0]);
+					draw_x = cur_flipx ? (cur_sx + (11'sd15 - {7'd0, draw_pix})) : (cur_sx + {7'd0, draw_pix});
+
+					if (pixel != 4'd0 && draw_x >= 0 && draw_x < $signed({1'b0, H_ACTIVE})) begin
+						lb_we    <= 1'b1;
+						lb_waddr <= draw_x[9:0];
+						lb_wdata <= {1'b0, cur_prio, cur_color, pixel};
+					end
+
+					if (draw_pix == 4'd7) begin
+						// Fetch right half
+						spriterom_addr <= {cur_code, draw_row_in_spr[3], 1'b1, draw_row_in_spr[2:0], 2'b00};
+						spriterom_req  <= 1'b1;
+						draw_pix       <= 4'd8;
+						draw_state     <= D_WAIT_ROM;
+					end else if (draw_pix == 4'd15) begin
+						draw_state <= D_NEXT;
+					end else begin
+						draw_pix <= draw_pix + 4'd1;
+					end
+				end
+
+				// Advance to next match
+				D_NEXT: draw_state <= D_POP;
+
+				default: draw_state <= D_IDLE;
+			endcase
+		end
 	end
 end
 

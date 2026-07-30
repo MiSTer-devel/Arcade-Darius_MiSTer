@@ -19,10 +19,10 @@
 
 */
 
-// darius_vram_arbiter — Arbitro letture VRAM condivisa.
-// Round-robin edge-based per 3 panel renderer sullo stesso VRAM.
-// Panel pulsano req per 1 ciclo quando l'indirizzo è set, l'arbiter latcha
-// in pending, serve il ciclo successivo, consegna dati 2 cicli dopo.
+// darius_vram_arbiter — shared VRAM read arbiter.
+// Edge-based round-robin for 3 panel renderers on the same VRAM.
+// Panels pulse req for 1 cycle when the address is set, the arbiter latches
+// it as pending, serves the next cycle, and delivers data 2 cycles later.
 
 module darius_vram_arbiter (
 	input  wire        clk,

@@ -19,11 +19,11 @@
 
 */
 
-// rom_cache — Instruction cache direct-mapped per CPU ROM.
-// 512 entry × 16-bit: hit in 1 ciclo vs 7+ cicli da SDRAM.
-// Sta tra il CPU ROM port e l'sdram_bridge. Su miss fa fetch da SDRAM,
-// riempie la cache e restituisce il dato. Riduce la latenza del fetch
-// del Main 68K.
+// rom_cache — direct-mapped instruction cache for the CPU ROM.
+// 512 entries × 16-bit: hit in 1 cycle vs 7+ cycles from SDRAM.
+// Sits between the CPU ROM port and the sdram_bridge. On a miss it fetches
+// from SDRAM, fills the cache and returns the data. Reduces the Main 68K
+// fetch latency.
 //
 // 512 entries × (15-bit tag + 16-bit data + 1 valid) = ~16 Kbit = 2 M10K
 // Index: byte_addr[10:2] (word addr [9:1])

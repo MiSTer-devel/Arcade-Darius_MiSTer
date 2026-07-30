@@ -119,8 +119,10 @@ cpu68000_fx68k_bridge #(.CPU_ID(CPU_ID)) u_bridge (
 	.fx_dsn(fx_dsn),
 	.last_read(cpu_last_read_unused),
 	.dbg_pc(cpu_dbg_pc),
+	.fc_out(cpu_fc_w),
 	.iack(cpu_iack)
 );
+wire [2:0] cpu_fc_w;
 
 assign bus_addr    = cpu_bus_addr;
 assign bus_asn     = fx_asn;
@@ -128,7 +130,7 @@ assign bus_rnw     = cpu_bus_rd;
 assign bus_dsn     = cpu_dsn_out;
 assign bus_dout    = cpu_bus_wdata;
 assign dbg_pc      = cpu_dbg_pc;
-assign dbg_fc      = 3'd0;
+assign dbg_fc      = cpu_fc_w;   // FC reale FX68K (necessario a ss_m68k)
 assign dbg_dtackn  = dtack_n;
 assign iack        = cpu_iack;
 

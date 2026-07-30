@@ -20,9 +20,9 @@
 */
 
 // darius_fg_renderer — FG (text/HUD) layer renderer.
-// Tilemap 108×24 per popup score, INSERT COIN, testo attract. Text ROM in
-// BRAM locale (zero contesa SDRAM), lettura con 1 ciclo di latenza.
-// Doppio line buffer per prep/emit sfasati.
+// 108×24 tilemap for score popups, INSERT COIN, attract text. Text ROM in
+// local BRAM (zero SDRAM contention), read with 1 cycle of latency.
+// Double line buffer for staggered prep/emit.
 //
 // Double buffer: display_buf_sel / prep_buf_sel (panel_renderer pattern).
 
